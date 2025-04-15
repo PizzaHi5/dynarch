@@ -28,11 +28,15 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-class AgentNode:
-    def __init__(self, name: str, agent: Any):
-        self.name = name  # Unique identifier for the agent
-        self.agent = agent  # The agent instance
-        self.children: list[AgentNode] = []  # List of child agents
+class AgentNode(BaseModel):
+    name: str = ""
+    agent: Any = None
+    children: list["AgentNode"] = Field(default_factory=list)
+
+    # def __init__(self, name: str, agent: Any):
+    #     self.node_name = name  # Unique identifier for the agent
+    #     self.agent = agent  # The agent instance
+    #     self.children: list[AgentNode] = []  # List of child agents
 
     def add_child(self, child: "AgentNode"):
         self.children.append(child)
@@ -46,11 +50,24 @@ class AgentNode:
                 return result
         return None
 
+class Task(BaseModel):
+    task_prompt: str = Field(examples="Research how to build optimal Python code for interacting with Google Maps API", default_factory=str)
+    agent_type_int: Literal['supervisor', 'codeact', 'deep_research'] = Field(description="Must be one of: 'supervisor', 'codeact', 'deep_research'")
+    agent_name: str = Field(description="name of the agent assigned to this task", default_factory=str)
+    supervisor_prompt: str = Field(description="this is the prompt the supervisor will use to review deep research topics", default_factory=str)
+    supervisor_name: str = Field(description="The name of the supervisor agent", default_factory=str)
+
+class SupervisorOutput(BaseModel):
+    messages: Annotated[list[AnyMessage], add_messages] = Field(default_factory=list)
+    tasks: list[Task] = Field(default_factory=list)
+
 class State(BaseModel):
     """Overall data state"""
     messages: Annotated[list[AnyMessage], add_messages] = Field(default_factory=list)
     tools: list[Any] = Field(default_factory=list)
     agents: AgentNode = Field(default_factory=lambda: AgentNode(name="root", agent=None))  # Root of the tree
+
+    tasks: list[Task] = Field(default_factory=list)
 
 SYS_MSG = """
 You are an agent in a company of agents. Your goal is to accomplish what the user requests to the best of your company's ability. Break down the task into actionable broad high-level tasks 
@@ -62,8 +79,11 @@ Remember:
 
 To complete the task, you can make tool calls to hire a team of: 
 - supervisor agents to further breakdown a task
-- codeact agents to write and execute code for a task
-- deep research agents to learn more about how to solve a task and steps to complete the task
+- deep research agents to learn more about how to solve a task and steps to complete a task
+- codeact agents to write and execute code to complete a task
+
+Your specific task is listed below:
+
 """
 #- swarm agents to solve a highly-specific task
 memory = MemorySaver()
@@ -82,18 +102,20 @@ config = {"configurable": {"thread_id": thread_id,
 # codeact_model = init_chat_model(ModelTier.ECO_REASONING.value, model_provider='openai')    
 
 # https://github.com/langchain-ai/open_deep_research
-async def create_deep_research_agent(state: State, config: RunnableConfig, supervisor_name: str, supervisor_prompt: str, topic: str, agent_name: str):
+async def create_deep_research_agent(state: State, config: RunnableConfig, supervisor_name: str, supervisor_prompt: str, topic: str, agent_name: str) -> dict:
     """
     Creates a Deep Research agent to perform in-depth research on a given topic. Call this tool to gather detailed insights.
 
     Args:
         state: OverallState object containing tools and messages.
         config: RunnableConfig object for the agent's runtime configuration.
+        supervisor_name: String name of the supervisor agent who made this agent.
         supervisor_prompt: A string to guide the supervisor's review of the research plan.
         topic: A string specifying the research topic.
+        agent_name: String name of this new deep research agent
 
     Returns:
-        A dictionary containing the research agent's response messages.
+        dict: A dictionary containing the research agent's response messages.
     """
     is_proceed = False
     research_plan = None
@@ -132,16 +154,18 @@ async def create_deep_research_agent(state: State, config: RunnableConfig, super
     return {'messages': output}
 
 # https://github.com/huggingface/smolagents
-def create_codeact_agent(state: State, task_prompt: str, supervisor_name: str, agent_name: str):
+def create_codeact_agent(state: State, task_prompt: str, supervisor_name: str, agent_name: str) -> dict:
     """
-    Creates a CodeAct agent to write and execute code. Call this tool to automate coding tasks.
+    Creates a CodeAct agent to write and execute code. Call this tool to complete coding tasks.
 
     Args:
         state: OverallState object containing tools and configurations.
         task_prompt: A string describing the task the agent should perform (e.g., "Write a Python function to calculate factorial").
-
+        supervisor_name: String name of the supervisor agent who made this agent.
+        agent_name: String name of this new codeact agent. 
+        
     Returns:
-        A dictionary containing the agent's response messages.
+        dict: A dictionary containing the agent's response messages.
     """
     # production environment should wrap this in a sandbox
     # codeact_agent = codeact.compile(checkpointer=MemorySaver())
@@ -158,67 +182,79 @@ def create_codeact_agent(state: State, task_prompt: str, supervisor_name: str, a
     return {'messages': response}
 
 # supervisor agent
-def create_supervisor_agent(state: State, config: RunnableConfig, supervisor_name: str, agent_name: str):
+def create_supervisor_agent(state: State, config: RunnableConfig, supervisor_name: str, agent_name: str, prompt: str) -> SupervisorOutput:
     """
-    Creates a Supervisor agent to manage and delegate tasks. Call this tool to oversee task execution and coordination.
+    Creates a Supervisor agent to breakdown high level tasks into many lower level tasks and creates agents for each task. Call this tool to breakdown a high level task into many more detailed tasks.
 
     Args:
         state: OverallState object containing tools and messages.
         config: RunnableConfig object for the agent's runtime configuration.
-        name: Name of the supervisor agent. Make it related to the prompt input
+        supervisor_name: String name of the supervisor agent who made this agent.
+        agent_name: String name of this new supervisor agent. Make it related to the prompt input.
+        prompt: String objective this agent will breakdown further to solve with its own agents.
         
     Returns:
-        A dictionary containing the supervisor agent's response messages.
+        SupervisorOutput: An object containing 'messages' and 'tasks'.
     """
-    agent_flow = create_supervisor(
-        agents=[child.agent for child in state.agents.find_agent(supervisor_name).children],
-        model=get_openai_model(ModelTier.ECO_REASONING.value),
-        prompt=SYS_MSG,
-        tools=state.tools,
-        supervisor_name=agent_name
-    ) 
-    supervisor_agent = agent_flow.compile(name=agent_name)
+    # Create root supervisor
+    if (supervisor_name == '' or supervisor_name is None) and agent_name == 'root':
+        agent_flow = create_supervisor(
+            model=get_openai_model(ModelTier.ECO_REASONING.value),
+            prompt=SYS_MSG,
+            response_format=SupervisorOutput,
+            tools=state.tools,
+            supervisor_name=agent_name
+        )
+    else:
+        agent_flow = create_supervisor(
+            agents=[child.agent for child in state.agents.find_agent(supervisor_name).children],
+            model=get_openai_model(ModelTier.ECO_REASONING.value),
+            prompt=SYS_MSG + prompt,
+            response_format=SupervisorOutput,
+            tools=state.tools,
+            supervisor_name=agent_name
+        ) 
+    supervisor_agent = agent_flow.compile(checkpointer=memory, name=agent_name)
 
     # add agent to parent
     if not agent_name == 'root':
         add_agent(state, supervisor_name, agent_name, supervisor_agent)
 
+    # Result is a SupervisorOutput
     result = supervisor_agent.invoke(
         input={"messages": state.messages},
         config=config
     )
-    return {'messages': result}
+    print(result)
 
-# def create_agent(
-#         agent_type: Literal['supervisor', 'codeact', 'deep_research'], 
-#         state: State, 
-#         config: RunnableConfig, 
-#         **kwargs) -> AgentNode:
-#     """
-#     Factory function to create agents based on type.
+    output = SupervisorOutput(messages=result.messages, tasks=result.tasks)
+    
+    return output
 
-#     Args:
-#         agent_type: The type of agent to create (e.g., "supervisor", "codeact", "deep_research").
-#         state: The current state object.
-#         config: Configuration for the agent.
-#         kwargs: Dictionary of string arguments for agent creation. Keys can include "name", "task_prompt", "supervisor_prompt", and "topic"
+# Looping structure
+def execute_tasks(state: State, config: RunnableConfig) -> State:
+    """
+    Executes the tasks in the state by creating and running the appropriate agents.
 
-#     Returns:
-#         An AgentNode representing the created agent.
-#     """
-#     if agent_type == "supervisor":
-#         agent_instance = create_supervisor_agent(state, config, name=kwargs.get("name", "supervisor"))
-#     elif agent_type == "codeact":
-#         agent_instance = create_codeact_agent(state, task_prompt=kwargs.get("task_prompt", ""))
-#     elif agent_type == "deep_research":
-#         agent_instance = create_deep_research_agent(
-#             state, config, supervisor_prompt=kwargs.get("supervisor_prompt", ""), topic=kwargs.get("topic", "")
-#         )
-#     else:
-#         raise ValueError(f"Unknown agent type: {agent_type}")
+    Args:
+        state: The overall state object containing tasks and agents.
+        config: The runtime configuration for the agents.
 
-#     return AgentNode(name=kwargs.get("name", agent_type), agent=agent_instance)
-
+    Returns:
+        State: The updated state after executing the tasks.
+    """
+    for task in state.tasks:
+        #check/create supervisors
+        if task.agent_type_int == 'supervisor':
+            create_supervisor_agent(state, config, task.supervisor_name, task.agent_name, task.task_prompt)
+        elif task.agent_type_int == 'codeact':
+            create_codeact_agent(state, task.task_prompt, task.supervisor_name, task.agent_name)
+        elif task.agent_type_int == 'deep_research':
+            create_deep_research_agent(state, config, task.supervisor_name, task.supervisor_prompt, task.task_prompt, task.agent_name)
+        else:
+            raise ValueError("How did you mess this up?")
+    
+    return state
 # swarm agent
 # def create_swarm_agents(state: State, config: RunnableConfig, tools: list[Any]):
 #     checkpointer = InMemoryStore()
@@ -232,13 +268,35 @@ def create_supervisor_agent(state: State, config: RunnableConfig, supervisor_nam
 
 # Adds child agent to parent agent in State
 def add_agent(state: State, parent_name: str, agent_name: str, agent_instance: Any):
+    """
+    Adds a child agent to the parent agent in the state.
+
+    Args:
+        state: The overall state object containing agents.
+        parent_name: The name of the parent agent.
+        agent_name: The name of the new agent to add.
+        agent_instance: The instance of the new agent.
+
+    Returns:
+        None
+    """
     parent_node = state.agents.find_agent(parent_name)
     if not parent_node:
         raise ValueError(f"Parent agent '{parent_name}' not found.")
     new_agent = AgentNode(name=agent_name, agent=agent_instance)
     parent_node.add_child(new_agent)
 
-def setup(state: State):
+def setup(state: State, config: RunnableConfig) -> dict:
+    """
+    Sets up the initial state and creates the root supervisor agent.
+
+    Args:
+        state: The overall state object containing tools and messages.
+        config: The runtime configuration for the agents.
+
+    Returns:
+        dict: A dictionary containing 'messages' and 'tasks'.
+    """
     # checkpointer.search(...)
     state.messages = []
     state.tools = [
@@ -246,16 +304,29 @@ def setup(state: State):
         create_codeact_agent,
         create_deep_research_agent
     ]
-    state.agents = create_supervisor_agent(state=state, config=config, name='root')
-    return state
+    root_node = AgentNode(name="root", agent='None', children=[])
+    root_agent_response = create_supervisor_agent(
+        state=state, 
+        config=config, 
+        supervisor_name='', 
+        agent_name='root',
+        prompt="You are the root agent. Your generated tasks should be broken down further."
+        )
+    root_node.agent = 'supervisor'
+    state.tasks = root_agent_response.tasks
+
+    return {
+        'messages': root_agent_response.messages,
+        'tasks': root_agent_response.tasks
+    }
 
 # Graph
 builder = StateGraph(State)
 builder.add_node("setup", setup)
-builder.add_node("ceo", create_supervisor_agent)
+builder.add_node("execution", execute_tasks)
 
 builder.add_edge(START, "setup")
-builder.add_edge("setup", "ceo")
-builder.add_edge("ceo", END)
+builder.add_edge("setup", "execution")
+builder.add_edge("execution", END)
 
 graph = builder.compile(name="Overall")
